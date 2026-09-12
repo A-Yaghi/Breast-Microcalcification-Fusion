@@ -1,0 +1,90 @@
+import os
+import glob
+import numpy as np
+import SimpleITK as sitk
+from scipy import ndimage
+
+def normalize_volume(volume):
+    """Normalize the volume to [0, 1] safely"""
+    # 1. Cast to float32 IMMEDIATELY to prevent uint8 overflow errors
+    volume = volume.astype("float32")
+    
+    # 2. Set the correct 8-bit boundaries
+    min_val = 0.0
+    max_val = 255.0 
+    
+    # 3. Clip and normalize
+    volume[volume < min_val] = min_val
+    volume[volume > max_val] = max_val
+    volume = (volume - min_val) / (max_val - min_val)
+    
+    return volume
+
+def normalize_and_resize_mcs_with_aspect_ratio(all_MCs_images, desired_size, output_folder):
+    # Ensure the output folder exists
+    os.makedirs(output_folder, exist_ok=True)
+    
+    total_images = len(all_MCs_images)
+
+    for i, mc_path in enumerate(sorted(all_MCs_images)):
+        filename = os.path.basename(mc_path)
+        
+        # Read the NRRD volume
+        volume_np = sitk.GetArrayFromImage(sitk.ReadImage(mc_path))
+        volume_np_normalized = normalize_volume(volume_np)
+
+        # Find the longest dimension
+        max_size = max(volume_np.shape[0], volume_np.shape[1], volume_np.shape[2])
+
+        # Compute scale factor so the longest side becomes exactly 'desired_size'
+        zoom_factor = max_size / desired_size
+        zoom_scale = 1 / zoom_factor
+
+        # Resize the volume (maintaining aspect ratio)
+        img = ndimage.zoom(volume_np_normalized, (zoom_scale, zoom_scale, zoom_scale), order=1)
+
+        # Calculate exact padding needed for X, Y, and Z axes
+        pad_x_l = (desired_size - img.shape[0]) // 2
+        pad_x_r = desired_size - img.shape[0] - pad_x_l
+
+        pad_y_l = (desired_size - img.shape[1]) // 2
+        pad_y_r = desired_size - img.shape[1] - pad_y_l
+
+        pad_z_l = (desired_size - img.shape[2]) // 2
+        pad_z_r = desired_size - img.shape[2] - pad_z_l
+
+        # Apply Zero-Padding
+        padded_img = np.pad(img, ((pad_x_l, pad_x_r), (pad_y_l, pad_y_r), (pad_z_l, pad_z_r)), 'constant')
+
+        # Safety Check
+        if padded_img.shape != (desired_size, desired_size, desired_size):
+            print(f"[!] Warning: {filename} did not reach {desired_size}^3. Actual: {padded_img.shape}")
+            continue
+
+        # Save the new normalized & padded NRRD file
+        output_path = os.path.join(output_folder, filename)
+        writer = sitk.ImageFileWriter()
+        writer.SetFileName(output_path)
+        writer.Execute(sitk.GetImageFromArray(padded_img))
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{total_images} images...")
+
+    print('\n✅ Pre-processing Complete!')
+
+if __name__ == '__main__':
+    # ================= CONFIGURATION =================
+    # 1. Point this to the folder containing your raw, unzipped .nrrd files
+    RAW_IMAGES_DIR = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\Zero_background_Images_Dilation_10" 
+    
+    # 2. Where you want the new perfectly sized images to be saved
+    OUTPUT_DIR = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\MCs_64x64x64"
+    # =================================================
+
+    all_MCs_images = glob.glob(os.path.join(RAW_IMAGES_DIR, '*.nrrd'))
+    
+    if len(all_MCs_images) == 0:
+        print("No .nrrd files found! Please check your RAW_IMAGES_DIR path.")
+    else:
+        print(f"Found {len(all_MCs_images)} images. Starting processing...")
+        normalize_and_resize_mcs_with_aspect_ratio(all_MCs_images, desired_size=64, output_folder=OUTPUT_DIR)
