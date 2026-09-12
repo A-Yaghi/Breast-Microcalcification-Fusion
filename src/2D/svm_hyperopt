@@ -1,0 +1,99 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GroupKFold, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+# ================= CONFIGURATION =================
+CSV_PATH = r"C:\Users\q_51_\VUB Pixiu Drive\be57b692-7569-4b64-863a-57a6fb0ab95e\etro-embed-mammo\processing\Abbas.Yaghi\Tabular\training_manifest.csv"
+N_SPLITS = 5
+
+FEATURE_COLUMNS = [
+    'age_at_study', 'size', 'distance', 'tissueden',
+    'location_1', 'location_10', 'location_11', 'location_12', 'location_2', 
+    'location_3', 'location_3,S', 'location_4', 'location_6', 'location_6,I', 
+    'location_6,Y,Z', 'location_8', 'location_9', 'location_A', 'location_C', 
+    'location_C,UP', 'location_D', 'location_I', 'location_IN', 'location_L', 
+    'location_L,S', 'location_MD', 'location_OU', 'location_S', 'location_U', 
+    'location_UP', 'location_Unknown', 'location_W', 'location_W,X,C', 
+    'location_X', 'location_Y', 'location_Z',
+    'depth_A', 'depth_M', 'depth_P', 'depth_Unknown',
+    'ETHNIC_GROUP_DESC_Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Non-Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Not Recorded', 
+    'ETHNIC_GROUP_DESC_Unknown~Non-Hispanic', 
+    'ETHNIC_GROUP_DESC_Unreported, Unknown, Unavailable',
+    'ETHNICITY_DESC_African American  or Black', 
+    'ETHNICITY_DESC_American Indian or Alaskan Native', 
+    'ETHNICITY_DESC_Asian', 
+    'ETHNICITY_DESC_Caucasian or White', 
+    'ETHNICITY_DESC_Multiple', 
+    'ETHNICITY_DESC_Unknown, Unavailable or Unreported',
+    'calcfind_A', 'calcfind_B', 'calcfind_F', 'calcfind_G', 'calcfind_H', 
+    'calcfind_I', 'calcfind_K', 'calcfind_M', 'calcfind_P', 'calcfind_Q', 
+    'calcfind_R',
+    'calcdistri_C', 'calcdistri_D', 'calcdistri_G', 'calcdistri_L', 
+    'calcdistri_R', 'calcdistri_S', 'calcdistri_Unknown'
+]
+
+TARGET_COLUMN = 'target_label'
+PATIENT_ID_COLUMN = 'empi_anon'
+# =================================================
+
+def main():
+    print("--- LOADING TABULAR DATA ---")
+    df = pd.read_csv(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    
+    X = df[FEATURE_COLUMNS]
+    y = df[TARGET_COLUMN]
+    groups = df[PATIENT_ID_COLUMN]
+
+    # 1. Build the Pipeline
+    # This ensures scaling happens INSIDE the cross-validation loop
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+        ('svm', SVC(probability=True, class_weight='balanced', random_state=42))
+    ])
+
+    # 2. Define the Hyperparameter Grid
+    # The 'svm__' prefix tells the pipeline these parameters belong to the SVC step
+    param_grid = {
+        'svm__C': [0.01, 0.1, 1, 10, 100],            # Penalty parameter (Regularization)
+        'svm__kernel': ['linear', 'rbf', 'poly'],     # Shape of the decision boundary
+        'svm__gamma': ['scale', 'auto', 0.01, 0.1],   # Kernel coefficient (only used for rbf and poly)
+        'svm__degree': [2, 3]                         # Degree of the polynomial kernel function
+    }
+
+    # 3. Setup the GroupKFold exactly like our previous scripts
+    gkf = GroupKFold(n_splits=N_SPLITS)
+
+    # 4. Initialize GridSearchCV
+    print("\n--- STARTING GRID SEARCH (This may take a few minutes) ---")
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=gkf,
+        scoring='roc_auc',
+        n_jobs=-1,  # Uses all available CPU cores on the supercomputer
+        verbose=1
+    )
+
+    # 5. Run the Search
+    grid_search.fit(X, y, groups=groups)
+
+    # 6. Report the Results
+    print("\n" + "="*50)
+    print("HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("="*50)
+    print(f"BEST MEAN CV AUC: {grid_search.best_score_:.4f}")
+    print("\nOPTIMAL PARAMETERS:")
+    for param_name, param_value in grid_search.best_params_.items():
+        # Strip the 'svm__' prefix for a cleaner printout
+        print(f"  * {param_name.replace('svm__', '')}: {param_value}")
+    print("="*50 + "\n")
+
+if __name__ == '__main__':
+    main()
