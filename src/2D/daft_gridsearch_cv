@@ -1,0 +1,230 @@
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+from PIL import Image
+import itertools
+import wandb 
+
+# ================= CONFIGURATION =================
+CSV_PATH = "Tabular/training_manifest.csv"
+IMAGE_DIR = "Images"  
+IMAGE_SIZE = 512
+N_SPLITS = 5  
+
+EPOCHS = 100
+MIN_EPOCHS = 50
+PATIENCE = 12
+
+TARGET_COLUMN = 'target_label'
+PATIENT_ID_COLUMN = 'empi_anon'
+
+# THE EXPANDED GRID
+GRID = {
+    'lr': [0.001, 0.0001, 0.00001],
+    'bottleneck_dim': [32, 64, 128, 256],  
+    'daft_dropout': [0.1, 0.2, 0.5]
+}
+
+FEATURE_COLUMNS = [
+    'age_at_study', 'size', 'distance', 'tissueden',
+    'location_1', 'location_10', 'location_11', 'location_12', 'location_2', 
+    'location_3', 'location_3,S', 'location_4', 'location_6', 'location_6,I', 
+    'location_6,Y,Z', 'location_8', 'location_9', 'location_A', 'location_C', 
+    'location_C,UP', 'location_D', 'location_I', 'location_IN', 'location_L', 
+    'location_L,S', 'location_MD', 'location_OU', 'location_S', 'location_U', 
+    'location_UP', 'location_Unknown', 'location_W', 'location_W,X,C', 
+    'location_X', 'location_Y', 'location_Z',
+    'depth_A', 'depth_M', 'depth_P', 'depth_Unknown',
+    'ETHNIC_GROUP_DESC_Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Non-Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Not Recorded', 
+    'ETHNIC_GROUP_DESC_Unknown~Non-Hispanic', 
+    'ETHNIC_GROUP_DESC_Unreported, Unknown, Unavailable',
+    'ETHNICITY_DESC_African American  or Black', 
+    'ETHNICITY_DESC_American Indian or Alaskan Native', 
+    'ETHNICITY_DESC_Asian', 
+    'ETHNICITY_DESC_Caucasian or White', 
+    'ETHNICITY_DESC_Multiple', 
+    'ETHNICITY_DESC_Unknown, Unavailable or Unreported',
+    'calcfind_A', 'calcfind_B', 'calcfind_F', 'calcfind_G', 'calcfind_H', 
+    'calcfind_I', 'calcfind_K', 'calcfind_M', 'calcfind_P', 'calcfind_Q', 
+    'calcfind_R',
+    'calcdistri_C', 'calcdistri_D', 'calcdistri_G', 'calcdistri_L', 
+    'calcdistri_R', 'calcdistri_S', 'calcdistri_Unknown'
+]
+
+class MammographyDataset(Dataset):
+    def __init__(self, dataframe, tabular_array, root_dir, transform=None):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.tabular_data = torch.tensor(tabular_array, dtype=torch.float32)
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_rel_path = self.dataframe.iloc[idx]['cropped_image_file']
+        img_rel_path = img_rel_path.replace('Actionable', 'Malignant').replace('Nonactionable', 'Benign')
+        img_path = os.path.join(self.root_dir, img_rel_path)
+        image = Image.open(img_path).convert('L')
+        if self.transform:
+            image = self.transform(image)
+        tab_features = self.tabular_data[idx]
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+        return image, tab_features, label
+
+class FaithfulDAFTBlock(nn.Module):
+    def __init__(self, in_channels, num_tabular_features, bottleneck_dim, dropout_rate):
+        super(FaithfulDAFTBlock, self).__init__()
+        self.bottleneck = nn.Sequential(
+            nn.Linear(in_channels + num_tabular_features, bottleneck_dim),
+            nn.BatchNorm1d(bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        self.gamma_proj = nn.Linear(bottleneck_dim, in_channels)
+        self.beta_proj = nn.Linear(bottleneck_dim, in_channels)
+
+    def forward(self, x_img, x_tab):
+        pooled_img = torch.mean(x_img, dim=(2, 3))
+        concat_features = torch.cat([pooled_img, x_tab], dim=1)
+        z = self.bottleneck(concat_features)
+        gamma = self.gamma_proj(z).unsqueeze(2).unsqueeze(3)
+        beta = self.beta_proj(z).unsqueeze(2).unsqueeze(3)
+        return (1.0 + gamma) * x_img + beta
+
+class DAFTResNet18(nn.Module):
+    def __init__(self, num_tabular_features, bottleneck_dim, daft_dropout):
+        super(DAFTResNet18, self).__init__()
+        self.backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.conv1, self.bn1, self.relu, self.maxpool = self.backbone.conv1, self.backbone.bn1, self.backbone.relu, self.backbone.maxpool
+        self.layer1, self.layer2, self.layer3, self.layer4 = self.backbone.layer1, self.backbone.layer2, self.backbone.layer3, self.backbone.layer4
+        self.daft = FaithfulDAFTBlock(512, num_tabular_features, bottleneck_dim, daft_dropout)
+        self.avgpool = self.backbone.avgpool
+        self.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(512, 1))
+
+    def forward(self, image, tabular):
+        x = self.maxpool(self.relu(self.bn1(self.conv1(image))))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.daft(x, tabular)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+def run_fold(fold, train_df, val_df, config, device, train_transform, val_transform):
+    # Tabular Processing
+    imputer = SimpleImputer(strategy='mean')
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(imputer.fit_transform(train_df[FEATURE_COLUMNS]))
+    X_val = scaler.transform(imputer.transform(val_df[FEATURE_COLUMNS]))
+
+    # Dataloaders
+    train_loader = DataLoader(MammographyDataset(train_df, X_train, IMAGE_DIR, train_transform), batch_size=32, shuffle=True, num_workers=4)
+    val_loader = DataLoader(MammographyDataset(val_df, X_val, IMAGE_DIR, val_transform), batch_size=32, shuffle=False, num_workers=4)
+
+    model = DAFTResNet18(len(FEATURE_COLUMNS), config.bottleneck_dim, config.daft_dropout).to(device)
+    
+    num_neg, num_pos = len(train_df[train_df[TARGET_COLUMN] == 0]), len(train_df[train_df[TARGET_COLUMN] == 1])
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([num_neg / num_pos]).to(device))
+    optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=0.001)
+
+    best_val_auc = 0.0
+    patience_counter = 0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        for img, tab, lbl in train_loader:
+            img, tab, lbl = img.to(device), tab.to(device), lbl.float().unsqueeze(1).to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(img, tab), lbl)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_true, val_pred = [], []
+        with torch.no_grad():
+            for img, tab, lbl in val_loader:
+                img, tab, lbl = img.to(device), tab.to(device), lbl.float().unsqueeze(1).to(device)
+                outputs = torch.sigmoid(model(img, tab))
+                val_true.extend(lbl.cpu().numpy())
+                val_pred.extend(outputs.cpu().numpy())
+        
+        try:
+            val_auc = roc_auc_score(val_true, val_pred)
+        except ValueError:
+            val_auc = 0.5
+            
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            patience_counter = 0
+        elif epoch + 1 >= MIN_EPOCHS:
+            patience_counter += 1
+        
+        if epoch + 1 >= MIN_EPOCHS and patience_counter >= PATIENCE: break
+    
+    return best_val_auc
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    df = pd.read_csv(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    gkf = GroupKFold(n_splits=N_SPLITS)
+
+    train_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.RandomHorizontalFlip(p=0.5), 
+        transforms.RandomVerticalFlip(p=0.5),   
+        transforms.RandomRotation(degrees=15),  
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    keys, values = zip(*GRID.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    for i, combo in enumerate(combinations):
+        if i < 6: 
+            continue
+        run_name = f"daft_lr{combo['lr']}_dim{combo['bottleneck_dim']}_drop{combo['daft_dropout']}"
+        print(f"\n[{i+1}/{len(combinations)}] Starting Grid Search Combination: {run_name}")
+        
+        wandb.init(project="daft-gridsearch-optimization", name=run_name, config=combo)
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        
+        fold_aucs = []
+        for fold, (t_idx, v_idx) in enumerate(gkf.split(df, groups=df[PATIENT_ID_COLUMN])):
+            auc = run_fold(fold, df.iloc[t_idx].copy(), df.iloc[v_idx].copy(), wandb.config, device, train_transform, val_transform)
+            fold_aucs.append(auc)
+            wandb.log({f"fold_{fold+1}_final_auc": auc})
+        
+        mean_auc = np.mean(fold_aucs)
+        std_auc = np.std(fold_aucs)
+        print(f"Combination {run_name} Complete | Mean AUC: {mean_auc:.4f} ± {std_auc:.4f}")
+        
+        wandb.log({"mean_cv_auc": mean_auc, "std_cv_auc": std_auc})
+        wandb.finish()
+
+if __name__ == '__main__': 
+    main()
