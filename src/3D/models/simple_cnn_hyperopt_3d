@@ -1,0 +1,279 @@
+import os
+import copy
+import pandas as pd
+import numpy as np
+import nrrd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score
+import itertools
+import wandb
+
+# ================= CONFIGURATION =================
+CSV_PATH = "MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = "master_10fold_splits.csv"  
+IMAGE_DIR = "MCs_64x64x64"  
+
+TARGET_SHAPE = (64, 64, 64) 
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+EPOCHS = 300               
+MIN_EPOCHS = 200            
+PATIENCE = 10               
+# =================================================
+
+# --- 1. 3D IMAGE DATASET ---
+class MCs3DDataset(Dataset):
+    def __init__(self, dataframe, root_dir, target_shape):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.root_dir = root_dir
+        self.target_shape = target_shape
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx]['Image Path']
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+        
+        img_path = os.path.join(self.root_dir, img_name)
+        volume, _ = nrrd.read(img_path)
+        
+        vol_tensor = torch.tensor(volume, dtype=torch.float32)
+        vol_tensor = vol_tensor.unsqueeze(0) 
+        
+        return vol_tensor, label
+
+# --- 2. SIMPLE 3-LAYER 3D CNN ---
+class Simple3DCNN(nn.Module):
+    def __init__(self, dropout_rate=0.5):
+        super(Simple3DCNN, self).__init__()
+        self.conv1 = nn.Conv3d(1, 16, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool3d(2, 2)
+        
+        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
+        
+        self.global_pool = nn.AdaptiveAvgPool3d((4, 4, 4))
+        
+        self.fc1 = nn.Linear(64 * 4 * 4 * 4, 128)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = self.pool(torch.relu(self.conv3(x)))
+        x = self.global_pool(x)
+        
+        x = torch.flatten(x, 1)
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+# --- 3. MAIN GRID SEARCH PIPELINE ---
+def main():
+    print("--- LOADING DATA AND FIXED SPLITS ---")
+    df = pd.read_excel(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    
+    # Merge dataset with the 10-fold splits
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- USING DEVICE: {device} ---")
+
+    param_grid = {
+        'lr': [0.001, 0.0001],
+        'batch_size': [16, 32],  
+        'dropout': [0.3, 0.6]
+    }
+    
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    print(f"--- STARTING GRID SEARCH ({len(combinations)} Configurations) ---")
+
+    # Track BEST parameters based on HIGHEST AUC
+    best_overall_val_auc = 0.0
+    best_overall_test_auc = 0.0
+    best_params = None
+
+    for config_idx, config in enumerate(combinations):
+        print(f"\n[{config_idx+1}/{len(combinations)}] Testing Params: {config}")
+        
+        run_name = f"Simple3DCNN_lr{config['lr']}_bs{config['batch_size']}_drop{config['dropout']}"
+        wandb.init(
+            project="embed-thesis-phase2-Simple3DCNN",
+            name=run_name,
+            config=config,
+            reinit=True
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        
+        fold_val_losses = []
+        fold_val_aucs = []
+        fold_test_aucs = []
+        
+        # --- FIXED 10-FOLD LOOP ---
+        for current_fold in range(1, 11):
+            fold_df = df[df['Fold'] == current_fold]
+            
+            train_df = fold_df[fold_df['Split'] == 'Train'].copy()
+            val_df = fold_df[fold_df['Split'] == 'Val'].copy()
+            test_df = fold_df[fold_df['Split'] == 'Test'].copy()
+            
+            train_dataset = MCs3DDataset(train_df, IMAGE_DIR, TARGET_SHAPE)
+            val_dataset = MCs3DDataset(val_df, IMAGE_DIR, TARGET_SHAPE)
+            test_dataset = MCs3DDataset(test_df, IMAGE_DIR, TARGET_SHAPE)
+
+            train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
+            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+            test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+
+            model = Simple3DCNN(dropout_rate=config['dropout']).to(device)
+            
+            num_neg = len(train_df[train_df[TARGET_COLUMN] == 0])
+            num_pos = len(train_df[train_df[TARGET_COLUMN] == 1])
+            pos_weight = torch.tensor([num_neg / num_pos]).to(device) if num_pos > 0 else torch.tensor([1.0]).to(device)
+
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            optimizer = optim.Adam(model.parameters(), lr=config['lr'])
+            
+            # Start loss at infinity for tracking checkpoints
+            best_fold_val_loss = float('inf')
+            best_model_weights = None
+            patience_counter = 0
+            
+            for epoch in range(EPOCHS):
+                # --- TRAINING ---
+                model.train()
+                running_train_loss = 0.0
+                for volumes, labels in train_loader:
+                    volumes, labels = volumes.to(device), labels.float().unsqueeze(1).to(device)
+                    optimizer.zero_grad()
+                    loss = criterion(model(volumes), labels)
+                    loss.backward()
+                    optimizer.step()
+                    running_train_loss += loss.item()
+                
+                avg_train_loss = running_train_loss / len(train_loader)
+                
+                # --- VALIDATION ---
+                model.eval()
+                running_val_loss = 0.0
+                val_true, val_pred = [], []
+                with torch.no_grad():
+                    for volumes, labels in val_loader:
+                        volumes, labels = volumes.to(device), labels.float().unsqueeze(1).to(device)
+                        outputs = model(volumes)
+                        loss = criterion(outputs, labels)
+                        running_val_loss += loss.item()
+                        val_true.extend(labels.cpu().numpy())
+                        val_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                
+                avg_val_loss = running_val_loss / len(val_loader)
+                
+                try:
+                    val_auc = roc_auc_score(val_true, val_pred)
+                except ValueError:
+                    val_auc = 0.5
+                
+                wandb.log({
+                    f"fold_{current_fold}_train_loss": avg_train_loss,
+                    f"fold_{current_fold}_val_loss": avg_val_loss,
+                    f"fold_{current_fold}_val_auc": val_auc,
+                    "epoch": epoch
+                })
+
+                # --- TRACKING BEST MODEL CHECKPOINT (BASED ON LOSS) ---
+                if avg_val_loss < best_fold_val_loss:
+                    best_fold_val_loss = avg_val_loss
+                    best_model_weights = copy.deepcopy(model.state_dict()) 
+                    patience_counter = 0
+                elif epoch >= MIN_EPOCHS:
+                    patience_counter += 1
+                
+                if epoch >= MIN_EPOCHS and patience_counter >= PATIENCE:
+                    print(f"  [!] Fold {current_fold} Early stopping at Epoch {epoch+1} (Best Val Loss: {best_fold_val_loss:.4f})")
+                    break
+            
+            # --- EVALUATE ON TEST SET ---
+            # Load the weights that achieved the lowest Validation Loss
+            model.load_state_dict(best_model_weights)
+            model.eval()
+            
+            # Re-evaluate Validation AUC of the chosen checkpoint just for reporting
+            val_true_best, val_pred_best = [], []
+            with torch.no_grad():
+                for volumes, labels in val_loader:
+                    volumes = volumes.to(device)
+                    outputs = model(volumes)
+                    val_true_best.extend(labels.numpy())
+                    val_pred_best.extend(torch.sigmoid(outputs).cpu().numpy())
+            fold_val_aucs.append(roc_auc_score(val_true_best, val_pred_best))
+            
+            # True Test Set Evaluation
+            test_true, test_pred = [], []
+            with torch.no_grad():
+                for volumes, labels in test_loader:
+                    volumes = volumes.to(device)
+                    outputs = model(volumes)
+                    test_true.extend(labels.numpy())
+                    test_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                    
+            try:
+                test_auc = roc_auc_score(test_true, test_pred)
+            except ValueError:
+                test_auc = 0.5
+                
+            fold_val_losses.append(best_fold_val_loss)
+            fold_test_aucs.append(test_auc)
+            
+            wandb.log({
+                f"final_fold_{current_fold}_val_loss": best_fold_val_loss,
+                f"final_fold_{current_fold}_test_auc": test_auc
+            })
+            print(f"    -> Fold {current_fold} True Test AUC: {test_auc:.4f}")
+            
+        # Calculate Means and Standard Deviations
+        mean_val_loss = np.mean(fold_val_losses)
+        mean_val_auc = np.mean(fold_val_aucs)
+        std_val_auc = np.std(fold_val_aucs)
+        
+        mean_test_auc = np.mean(fold_test_aucs)
+        std_test_auc = np.std(fold_test_aucs)
+        
+        print(f"\n -> Config Val Loss: {mean_val_loss:.4f}")
+        print(f" -> Config Val AUC:  {mean_val_auc:.4f} ± {std_val_auc:.4f}")
+        print(f" -> Config Test AUC: {mean_test_auc:.4f} ± {std_test_auc:.4f}")
+        
+        wandb.log({
+            "mean_val_loss": mean_val_loss,
+            "mean_val_auc": mean_val_auc, "std_val_auc": std_val_auc,
+            "mean_test_auc": mean_test_auc, "std_test_auc": std_test_auc
+        })
+        wandb.finish() 
+        
+        # Select the absolute best hyperparameter configuration based on HIGHEST Validation AUC
+        if mean_val_auc > best_overall_val_auc:
+            best_overall_val_auc = mean_val_auc
+            best_overall_test_auc = mean_test_auc
+            best_params = config
+
+    print("\n" + "="*50)
+    print("SIMPLE 3D CNN HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("="*50)
+    print(f"BEST MEAN CV AUC (Validation): {best_overall_val_auc:.4f}")
+    print(f"TRUE HOLDOUT TEST AUC (Unseen): {best_overall_test_auc:.4f}")
+    print(f"OPTIMAL PARAMETERS: {best_params}")
+    print("="*50 + "\n")
+
+if __name__ == '__main__':
+    main()
