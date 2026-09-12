@@ -26,7 +26,7 @@ These architectures are evaluated across two distinct clinical environments:
 *   `src/2D/preprocessing/`: Logic for 2D spatial fixed-window cropping.
 *   `src/3D/models/`: tabular unimodels (XGBOOST, SVM), PyTorch implementations of the unimodal vision baselines (CNN, ResNet-18), the DAFT bottleneck module, and the Late Fusion meta-classifier for the 3D part.
 *   `src/2D/models/`: tabular unimodels (XGBOOST, SVM), PyTorch implementations of the unimodal vision baselines (CNN, ResNet-18), the DAFT bottleneck module, and the Late Fusion meta-classifier for the 2D part.
-*   `src/3D/statistics/`: Scripts for patient-level cross-validation splitting and statistical significance bootstrapping.
+*   `src/3D/Statistics/`: Scripts for patient-level cross-validation splitting and statistical significance bootstrapping.
 
 ## Technologies Used
 *   Python
