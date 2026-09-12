@@ -1,0 +1,152 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import ParameterGrid
+import xgboost as xgb
+import os
+
+# ================= CONFIGURATION =================
+EXCEL_PATH = "MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = "master_10fold_splits.csv"
+
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+# Included 'Fold' and 'Split' to strip them out before passing to the model
+METADATA_COLUMNS = ['Patient ID', 'Label', 'Image Path', 'Fold', 'Split']
+# =================================================
+
+def main():
+    print("--- LOADING TABULAR DATA AND FIXED SPLITS ---")
+    df = pd.read_excel(EXCEL_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    
+    # Merge the dataset with the splits
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    FEATURE_COLUMNS = [col for col in df.columns if col not in METADATA_COLUMNS]
+    print(f"Detected {len(FEATURE_COLUMNS)} feature columns!")
+
+    # 1. Build the Pipeline
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+        ('xgb', xgb.XGBClassifier(
+            objective='binary:logistic',
+            eval_metric='auc',
+            random_state=42,
+            n_jobs=-1  # <--- CRITICAL: This uses all available CPU cores to drastically speed up training
+            
+            # UNCOMMENT THE LINE BELOW IF RUNNING ON HPC WITH A GPU:
+            # tree_method='hist', device='cuda' 
+        ))
+    ])
+
+    # 2. Define the Hyperparameter Grid for XGBoost
+    param_grid = {
+        'xgb__max_depth': [2, 3, 4],                  
+        'xgb__learning_rate': [0.01, 0.05, 0.1],      
+        'xgb__n_estimators': [100, 200, 300],         
+        'xgb__subsample': [0.6, 0.8, 1.0],            
+        'xgb__colsample_bytree': [0.6, 0.8, 1.0]      
+    }
+    
+    grid = ParameterGrid(param_grid)
+    print(f"\n--- STARTING CUSTOM 10-FOLD GRID SEARCH ({len(grid)} Configurations) ---")
+
+    best_mean_val_auc = 0.0
+    best_params = None
+    
+    # 3. Phase 1: Hyperparameter Tuning (using Train and Val)
+    for idx, params in enumerate(grid):
+        pipeline.set_params(**params)
+        fold_val_aucs = []
+        
+        for current_fold in range(1, 11):
+            fold_df = df[df['Fold'] == current_fold]
+            
+            train_df = fold_df[fold_df['Split'] == 'Train']
+            val_df = fold_df[fold_df['Split'] == 'Val']
+            
+            X_train, y_train = train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN]
+            X_val, y_val = val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN]
+            
+            # Calculate class imbalance dynamically per fold on training data only
+            scale_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1])
+            pipeline.set_params(xgb__scale_pos_weight=scale_weight)
+
+            # Train and Validate
+            pipeline.fit(X_train, y_train)
+            val_probs = pipeline.predict_proba(X_val)[:, 1]
+            fold_val_aucs.append(roc_auc_score(y_val, val_probs))
+            
+        mean_val_auc = np.mean(fold_val_aucs)
+        
+        # Track the best performing configuration based on Validation sets
+        if mean_val_auc > best_mean_val_auc:
+            best_mean_val_auc = mean_val_auc
+            best_params = params
+
+    # 4. Phase 2: Final Unbiased Evaluation on Test Sets
+    print("\n--- TUNING COMPLETE. EVALUATING BEST MODEL ON UNSEEN TEST SETS ---")
+    pipeline.set_params(**best_params)
+    
+    test_aucs = []
+    val_aucs_for_best = [] 
+    
+    # --- NEW: List to collect predictions ---
+    all_fold_predictions = []
+    
+    for current_fold in range(1, 11):
+        fold_df = df[df['Fold'] == current_fold]
+        
+        train_df = fold_df[fold_df['Split'] == 'Train']
+        val_df = fold_df[fold_df['Split'] == 'Val']
+        test_df = fold_df[fold_df['Split'] == 'Test']
+        
+        X_train, y_train = train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN]
+        X_val, y_val = val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN]
+        X_test, y_test = test_df[FEATURE_COLUMNS], test_df[TARGET_COLUMN]
+        
+        # Calculate class imbalance dynamically per fold for final evaluation
+        scale_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1])
+        pipeline.set_params(xgb__scale_pos_weight=scale_weight)
+
+        pipeline.fit(X_train, y_train)
+        
+        val_probs = pipeline.predict_proba(X_val)[:, 1]
+        val_aucs_for_best.append(roc_auc_score(y_val, val_probs))
+        
+        test_probs = pipeline.predict_proba(X_test)[:, 1]
+        test_aucs.append(roc_auc_score(y_test, test_probs))
+        
+        # --- NEW: Save predictions for this fold ---
+        fold_preds = pd.DataFrame({
+            'Patient ID': test_df[PATIENT_ID_COLUMN].values,
+            'Fold': current_fold,
+            'True_Label': y_test.values,
+            'XGB_Prob': test_probs
+        })
+        all_fold_predictions.append(fold_preds)
+
+    # --- NEW: Compile and save all predictions to CSV ---
+    final_predictions_df = pd.concat(all_fold_predictions, ignore_index=True)
+    csv_out_name = 'xgboost_predictions.csv'
+    final_predictions_df.to_csv(csv_out_name, index=False)
+    print(f"\n-> SUCCESS: Saved {len(final_predictions_df)} raw predictions to '{csv_out_name}'")
+
+    # 5. Final Reporting
+    print("\n" + "="*60)
+    print("XGBOOST STRICT 10-FOLD CROSS-VALIDATION COMPLETE")
+    print("="*60)
+    print(f"BEST MEAN VAL AUC:  {np.mean(val_aucs_for_best):.4f} ± {np.std(val_aucs_for_best):.4f}")
+    print(f"TRUE MEAN TEST AUC: {np.mean(test_aucs):.4f} ± {np.std(test_aucs):.4f}")
+    print("\nOPTIMAL PARAMETERS:")
+    for param_name, param_value in best_params.items():
+        print(f"  * {param_name.replace('xgb__', '')}: {param_value}")
+    print("="*60 + "\n")
+
+if __name__ == '__main__':
+    main()
