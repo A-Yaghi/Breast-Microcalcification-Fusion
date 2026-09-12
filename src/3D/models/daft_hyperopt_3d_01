@@ -1,0 +1,381 @@
+import os
+import copy
+import pandas as pd
+import numpy as np
+import nrrd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models.video import r3d_18
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+import itertools
+import wandb 
+
+# ================= CONFIGURATION =================
+CSV_PATH = "MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = "master_10fold_splits.csv"  
+IMAGE_DIR = "MCs_64x64x64"  
+
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+EPOCHS = 100
+MIN_EPOCHS = 80
+PATIENCE = 10
+
+# Optimal ResNet3D Baseline Params 
+BATCH_SIZE = 16
+WEIGHT_DECAY = 1e-3
+RESNET_DROPOUT = 0.6
+
+# THE NEW DAFT GRID (12 Combinations)
+GRID = {
+    'lr': [0.001, 0.0001],
+    'bottleneck_dim': [32, 64],  
+    'daft_dropout': [0.2, 0.5]
+}
+# =================================================
+
+def preload_all_volumes(df, root_dir):
+    print("--- PRELOADING ALL 3D VOLUMES INTO RAM ---")
+    volume_cache = {}
+    unique_images = df['Image Path'].unique()
+    
+    for i, img_name in enumerate(unique_images):
+        img_path = os.path.join(root_dir, img_name)
+        volume, _ = nrrd.read(img_path)
+        vol_tensor = torch.tensor(volume, dtype=torch.float32).unsqueeze(0)
+        volume_cache[img_name] = vol_tensor
+        
+        if (i + 1) % 500 == 0:
+            print(f"  Loaded {i + 1} / {len(unique_images)} volumes...")
+            
+    print(f"--- SUCCESSFULLY PRELOADED {len(volume_cache)} VOLUMES ---")
+    return volume_cache
+
+# --- 1. 3D MULTIMODAL DATASET ---
+class MCs3DDAFTDataset(Dataset):
+    def __init__(self, dataframe, tabular_array, volume_cache):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.tabular_data = torch.tensor(tabular_array, dtype=torch.float32)
+        self.volume_cache = volume_cache
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx]['Image Path']
+        vol_tensor = self.volume_cache[img_name]
+        
+        tab_features = self.tabular_data[idx]
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+        return vol_tensor, tab_features, label
+
+# --- 2. THE CORE DAFT MODULE ---
+class FaithfulDAFTBlock3D(nn.Module):
+    def __init__(self, in_channels, num_tabular_features, bottleneck_dim, dropout_rate):
+        super(FaithfulDAFTBlock3D, self).__init__()
+        self.bottleneck = nn.Sequential(
+            nn.Linear(in_channels + num_tabular_features, bottleneck_dim, bias=False),
+            nn.BatchNorm1d(bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        self.gamma_proj = nn.Linear(bottleneck_dim, in_channels, bias=False)
+        self.beta_proj = nn.Linear(bottleneck_dim, in_channels, bias=False)
+
+    def forward(self, x_img, x_tab):
+        # Pool across spatial dimensions (Depth, Height, Width)
+        pooled_img = torch.mean(x_img, dim=(2, 3, 4))
+        concat_features = torch.cat([pooled_img, x_tab], dim=1)
+        
+        z = self.bottleneck(concat_features)
+        
+        gamma = self.gamma_proj(z).view(-1, x_img.size(1), 1, 1, 1)
+        beta = self.beta_proj(z).view(-1, x_img.size(1), 1, 1, 1)
+        
+        return (1.0 + gamma) * x_img + beta
+
+# --- 3. THE RESIDUAL BLOCK WRAPPER ---
+class DAFTBasicBlock3DWrapper(nn.Module):
+    def __init__(self, original_block, num_tabular_features, bottleneck_dim, dropout_rate):
+        super(DAFTBasicBlock3DWrapper, self).__init__()
+        self.block = original_block
+        
+        # layer4 in ResNet18 operates on 512 channels
+        self.daft = FaithfulDAFTBlock3D(
+            in_channels=512, 
+            num_tabular_features=num_tabular_features, 
+            bottleneck_dim=bottleneck_dim, 
+            dropout_rate=dropout_rate
+        )
+
+    def forward(self, x, tabular):
+        # 1. Save the identity for the residual connection (Bypasses DAFT)
+        identity = x
+        if self.block.downsample is not None:
+            identity = self.block.downsample(x)
+
+        # 2. Inject DAFT strictly BEFORE the first convolution of the main path
+        out = self.daft(x, tabular)
+        
+        # 3. Proceed through the 3D video BasicBlock (conv1 is a Sequential here)
+        out = self.block.conv1(out)
+        out = self.block.conv2(out)
+        
+        # 4. Add the untouched identity back and apply final ReLU
+        out += identity
+        out = self.block.relu(out)
+        
+        return out
+
+# --- 4. 3D DAFT RESNET18 ARCHITECTURE ---
+class DAFTResNet3D(nn.Module):
+    def __init__(self, num_tabular_features, bottleneck_dim, daft_dropout):
+        super(DAFTResNet3D, self).__init__()
+        self.base_model = r3d_18(weights=None)
+        
+        original_conv1 = self.base_model.stem[0]
+        self.base_model.stem[0] = nn.Conv3d(
+            in_channels=1, 
+            out_channels=original_conv1.out_channels, 
+            kernel_size=original_conv1.kernel_size, 
+            stride=original_conv1.stride, 
+            padding=original_conv1.padding, 
+            bias=False
+        )
+        
+        # Extract the final residual block (layer4[1]) and wrap it
+        last_res_block = self.base_model.layer4[1]
+        self.daft_res_block = DAFTBasicBlock3DWrapper(
+            original_block=last_res_block,
+            num_tabular_features=num_tabular_features,
+            bottleneck_dim=bottleneck_dim,
+            dropout_rate=daft_dropout
+        )
+        
+        # Replace the original last block with our modified one
+        self.base_model.layer4[1] = self.daft_res_block
+        
+        num_ftrs = self.base_model.fc.in_features
+        self.base_model.fc = nn.Sequential(
+            nn.Dropout(RESNET_DROPOUT),
+            nn.Linear(num_ftrs, 1)
+        )
+
+    def forward(self, image, tabular):
+        # 1. Forward through stem and first 3 layers
+        x = self.base_model.stem(image)
+        x = self.base_model.layer1(x)
+        x = self.base_model.layer2(x)
+        x = self.base_model.layer3(x)
+        
+        # 2. Forward through the first block of layer4
+        x = self.base_model.layer4[0](x)
+        
+        # 3. Forward through our custom wrapped DAFT residual block
+        x = self.base_model.layer4[1](x, tabular)
+        
+        # 4. Final classification layers
+        x = self.base_model.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.base_model.fc(x)
+        
+        return x.to(torch.float32)
+
+def run_fold(fold, train_df, val_df, test_df, feature_columns, volume_cache, config, device):
+    imputer = SimpleImputer(strategy='mean')
+    scaler = StandardScaler()
+    
+    X_train = scaler.fit_transform(imputer.fit_transform(train_df[feature_columns]))
+    X_val = scaler.transform(imputer.transform(val_df[feature_columns]))
+    X_test = scaler.transform(imputer.transform(test_df[feature_columns]))
+
+    train_loader = DataLoader(MCs3DDAFTDataset(train_df, X_train, volume_cache), batch_size=BATCH_SIZE, shuffle=True, num_workers=2, drop_last=True)
+    val_loader = DataLoader(MCs3DDAFTDataset(val_df, X_val, volume_cache), batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    test_loader = DataLoader(MCs3DDAFTDataset(test_df, X_test, volume_cache), batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+    model = DAFTResNet3D(len(feature_columns), config.bottleneck_dim, config.daft_dropout).to(device)
+    
+    num_neg, num_pos = len(train_df[train_df[TARGET_COLUMN] == 0]), len(train_df[train_df[TARGET_COLUMN] == 1])
+    pos_weight = torch.tensor([num_neg / num_pos]).to(device) if num_pos > 0 else torch.tensor([1.0]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
+    # Inject Dynamic Grid Search Learning Rate
+    optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=WEIGHT_DECAY)
+    scaler_amp = torch.amp.GradScaler('cuda')
+
+    best_val_loss = float('inf')
+    best_model_weights = None
+    patience_counter = 0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        running_train_loss = 0.0
+        
+        for img, tab, lbl in train_loader:
+            img, tab, lbl = img.to(device), tab.to(device), lbl.float().unsqueeze(1).to(device)
+            optimizer.zero_grad()
+            
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(img, tab)
+                loss = criterion(outputs, lbl)
+                
+            scaler_amp.scale(loss).backward()
+            scaler_amp.step(optimizer)
+            scaler_amp.update()
+            running_train_loss += loss.item()
+            
+        avg_train_loss = running_train_loss / len(train_loader)
+
+        model.eval()
+        running_val_loss = 0.0
+        val_true, val_pred = [], []
+        
+        with torch.no_grad():
+            for img, tab, lbl in val_loader:
+                img, tab, lbl = img.to(device), tab.to(device), lbl.float().unsqueeze(1).to(device)
+                
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(img, tab)
+                    val_loss = criterion(outputs, lbl)
+                    
+                running_val_loss += val_loss.item()
+                val_true.extend(lbl.cpu().numpy())
+                val_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                
+        avg_val_loss = running_val_loss / len(val_loader)
+        
+        try:
+            val_auc = roc_auc_score(val_true, val_pred)
+        except ValueError:
+            val_auc = 0.5
+            
+        wandb.log({
+            f"fold_{fold}_train_loss": avg_train_loss,
+            f"fold_{fold}_val_loss": avg_val_loss,
+            f"fold_{fold}_val_auc": val_auc,
+            "epoch": epoch + 1
+        })
+            
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_weights = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        elif epoch + 1 >= MIN_EPOCHS:
+            patience_counter += 1
+        
+        if epoch + 1 >= MIN_EPOCHS and patience_counter >= PATIENCE: 
+            print(f"   [!] Fold {fold} Early stopping at Epoch {epoch+1} (Best Val Loss: {best_val_loss:.4f})")
+            break
+            
+    # --- TEST SET EVALUATION ---
+    model.load_state_dict(best_model_weights)
+    model.eval()
+    test_true, test_pred = [], []
+    
+    with torch.no_grad():
+        for img, tab, lbl in test_loader:
+            img, tab, lbl = img.to(device), tab.to(device), lbl.float().unsqueeze(1).to(device)
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(img, tab)
+            test_true.extend(lbl.cpu().numpy())
+            test_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+            
+    try:
+        test_auc = roc_auc_score(test_true, test_pred)
+    except ValueError:
+        test_auc = 0.5
+
+    wandb.log({
+        f"final_fold_{fold}_val_loss": best_val_loss,
+        f"final_fold_{fold}_test_auc": test_auc
+    })
+    
+    return best_val_loss, val_auc, test_auc
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- USING DEVICE: {device} ---")
+    
+    print("--- LOADING DATA AND FIXED SPLITS ---")
+    df = pd.read_excel(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    
+    global_volume_cache = preload_all_volumes(df, IMAGE_DIR)
+    
+    metadata_cols = [PATIENT_ID_COLUMN, TARGET_COLUMN, 'Image Path', 'Mask Path', 'Fold', 'Split']
+    FEATURE_COLUMNS = [c for c in df.columns if c not in metadata_cols]
+
+    keys, values = zip(*GRID.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    print(f"--- STARTING DAFT 3D GRID SEARCH ({len(combinations)} Configurations) ---")
+
+    best_overall_val_auc = 0.0
+    best_overall_test_auc = 0.0
+    best_params = None
+
+    for i, combo in enumerate(combinations):
+        run_name = f"DAFT3D_lr{combo['lr']}_dim{combo['bottleneck_dim']}_drop{combo['daft_dropout']}"
+        print(f"\n[{i+1}/{len(combinations)}] Starting: {run_name}")
+        
+        wandb.init(project="embed-thesis-phase2-DAFT", name=run_name, config=combo, reinit=True)
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        
+        fold_val_losses, fold_val_aucs, fold_test_aucs = [], [], []
+        
+        for current_fold in range(1, 11):
+            fold_df = df[df['Fold'] == current_fold]
+            train_df = fold_df[fold_df['Split'] == 'Train'].copy()
+            val_df = fold_df[fold_df['Split'] == 'Val'].copy()
+            test_df = fold_df[fold_df['Split'] == 'Test'].copy()
+            
+            best_val_loss, val_auc, test_auc = run_fold(
+                current_fold, train_df, val_df, test_df, 
+                FEATURE_COLUMNS, global_volume_cache, wandb.config, device
+            )
+            
+            fold_val_losses.append(best_val_loss)
+            fold_val_aucs.append(val_auc)
+            fold_test_aucs.append(test_auc)
+            print(f"   -> Fold {current_fold} True Test AUC: {test_auc:.4f}")
+        
+        mean_val_loss = np.mean(fold_val_losses)
+        mean_val_auc = np.mean(fold_val_aucs)
+        std_val_auc = np.std(fold_val_aucs)
+        mean_test_auc = np.mean(fold_test_aucs)
+        std_test_auc = np.std(fold_test_aucs)
+        
+        print(f"\n -> Config Val Loss: {mean_val_loss:.4f}")
+        print(f" -> Config Val AUC:  {mean_val_auc:.4f} ± {std_val_auc:.4f}")
+        print(f" -> Config Test AUC: {mean_test_auc:.4f} ± {std_test_auc:.4f}")
+        
+        wandb.log({
+            "mean_val_loss": mean_val_loss,
+            "mean_val_auc": mean_val_auc, "std_val_auc": std_val_auc,
+            "mean_test_auc": mean_test_auc, "std_test_auc": std_test_auc
+        })
+        wandb.finish()
+        
+        if mean_val_auc > best_overall_val_auc:
+            best_overall_val_auc = mean_val_auc
+            best_overall_test_auc = mean_test_auc
+            best_params = combo
+
+    print("\n" + "="*50)
+    print("3D DAFT HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("="*50)
+    print(f"BEST MEAN CV AUC (Validation): {best_overall_val_auc:.4f}")
+    print(f"TRUE HOLDOUT TEST AUC (Unseen): {best_overall_test_auc:.4f}")
+    print(f"OPTIMAL PARAMETERS: {best_params}")
+    print("="*50 + "\n")
+
+if __name__ == '__main__': 
+    main()
