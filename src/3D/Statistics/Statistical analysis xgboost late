@@ -1,0 +1,146 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from statsmodels.stats.contingency_tables import mcnemar
+
+# ================= CONFIGURATION =================
+# Update these paths to where your files are stored
+FILE_EXCEL = r""
+FILE_SPLITS = r""
+
+FILE_MODEL_A = r""  # OR late_fusion_ablation_predictions.csv
+FILE_MODEL_B = r""
+
+# Which columns contain the probabilities in your CSVs?
+PROB_COL_A = "XGB_Prob"    # Change to 'Fusion_Prob' if testing Late Fusion
+PROB_COL_B = "Fusion_Prob"
+
+N_BOOTSTRAPS = 10000
+THRESHOLD = 0.5
+# =================================================
+
+def clean_col_label(series):
+    s_clean = series.astype(str).str.replace('[', '', regex=False).str.replace(']', '', regex=False)
+    return pd.to_numeric(s_clean).round().astype(int)
+
+def clean_col_prob(series):
+    s_clean = series.astype(str).str.replace('[', '', regex=False).str.replace(']', '', regex=False)
+    return pd.to_numeric(s_clean)
+
+def reconstruct_patient_ids():
+    """Reconstructs the exact sequence of Patient IDs based on the PyTorch data loader logic."""
+    df = pd.read_excel(FILE_EXCEL).dropna(subset=['Label']).reset_index(drop=True)
+    splits_df = pd.read_csv(FILE_SPLITS)
+    merged_df = df.merge(splits_df, on='Patient ID', how='inner')
+
+    test_patient_ids = []
+    
+    for fold in range(1, 11):
+        fold_df = merged_df[merged_df['Fold'] == fold]
+        test_df = fold_df[fold_df['Split'] == 'Test']
+        test_patient_ids.extend(test_df['Patient ID'].tolist())
+        
+    return test_patient_ids
+
+def clustered_bootstrap_auc(df, n_bootstraps=10000):
+    print(f"\n--- CLUSTERED BOOTSTRAPPED AUC COMPARISON ({n_bootstraps} Iterations) ---")
+    rng = np.random.RandomState(42)
+    auc_diffs = []
+    
+    unique_patients = df['Patient_ID'].unique()
+    n_patients = len(unique_patients)
+    
+    for i in range(n_bootstraps):
+        # 1. Sample PATIENTS with replacement (Patient-level clustering)
+        sampled_patients = rng.choice(unique_patients, size=n_patients, replace=True)
+        
+        # 2. Build the bootstrap dataframe from all MCs belonging to sampled patients
+        sampled_rows = pd.concat([df[df['Patient_ID'] == p] for p in sampled_patients])
+        
+        y_true = sampled_rows['True_Label'].values
+        
+        # Skip if sample lacks one of the classes
+        if len(np.unique(y_true)) < 2:
+            continue
+            
+        auc_a = roc_auc_score(y_true, sampled_rows['Prob_A'].values)
+        auc_b = roc_auc_score(y_true, sampled_rows['Prob_B'].values)
+        auc_diffs.append(auc_a - auc_b) 
+        
+    auc_diffs = np.array(auc_diffs)
+    mean_diff = np.mean(auc_diffs)
+    ci_lower = np.percentile(auc_diffs, 2.5)
+    ci_upper = np.percentile(auc_diffs, 97.5)
+    p_value = np.sum(auc_diffs <= 0) / len(auc_diffs)
+    
+    print(f"Mean AUC Difference (Model A - Model B): {mean_diff:.4f}")
+    print(f"95% Confidence Interval: [{ci_lower:.4f}, {ci_upper:.4f}]")
+    print(f"p-value: {p_value:.4f}")
+
+def patient_level_mcnemars(df, threshold=0.5):
+    print("\n--- PATIENT-LEVEL McNEMAR'S TEST ---")
+    
+    # Aggregate probabilities per patient (Mean probability)
+    patient_df = df.groupby('Patient_ID').agg({
+        'True_Label': 'max', # Target is the same for all MCs per patient
+        'Prob_A': 'mean',
+        'Prob_B': 'mean'
+    }).reset_index()
+    
+    print(f"Aggregated {len(df)} MCs into {len(patient_df)} unique patient-level predictions.")
+    
+    y_true = patient_df['True_Label'].values
+    pred_A = (patient_df['Prob_A'].values >= threshold).astype(int)
+    pred_B = (patient_df['Prob_B'].values >= threshold).astype(int)
+    
+    correct_A = (pred_A == y_true)
+    correct_B = (pred_B == y_true)
+    
+    n11 = np.sum(correct_A & correct_B) 
+    n10 = np.sum(correct_A & ~correct_B) 
+    n01 = np.sum(~correct_A & correct_B) 
+    n00 = np.sum(~correct_A & ~correct_B) 
+    
+    table = [[n11, n10], 
+             [n01, n00]]
+             
+    result = mcnemar(table, exact=False, correction=True)
+    
+    print("\nContingency Table (Patient-Level):")
+    print(f"  Both Correct: {n11} | Model A Correct, Model B Wrong: {n10}")
+    print(f"  Model A Wrong, Model B Correct: {n01} | Both Wrong: {n00}")
+    print(f"McNemar's p-value: {result.pvalue:.4f}")
+
+def main():
+    print("Loading predictions and reconstructing Patient IDs...")
+    
+    # 1. Reconstruct the Patient IDs from the Excel / Splits logic
+    patient_ids = reconstruct_patient_ids()
+    
+    # 2. Load the prediction files
+    df_A = pd.read_csv(FILE_MODEL_A)
+    df_B = pd.read_csv(FILE_MODEL_B)
+
+    # 3. Clean formatting and rename columns to standardize
+    df_A['True_Label'] = clean_col_label(df_A['True_Label'])
+    df_A['Prob_A'] = clean_col_prob(df_A[PROB_COL_A])
+    
+    df_B['Prob_B'] = clean_col_prob(df_B[PROB_COL_B])
+
+    # 4. Attach the reconstructed Patient IDs
+    df_A['Patient_ID'] = patient_ids
+    df_B['Patient_ID'] = patient_ids
+
+    # 5. Merge DataFrames to ensure perfect alignment
+    merged_df = pd.merge(df_A[['Patient_ID', 'True_Label', 'Prob_A']], 
+                         df_B[['Prob_B']], 
+                         left_index=True, right_index=True)
+
+    print(f"Successfully aligned {len(merged_df)} predictions with Patient IDs.")
+
+    # 6. Run the Clustered Statistical Tests
+    clustered_bootstrap_auc(merged_df, N_BOOTSTRAPS)
+    patient_level_mcnemars(merged_df, THRESHOLD)
+
+if __name__ == "__main__":
+    main()
