@@ -1,0 +1,311 @@
+import os
+import copy
+import pandas as pd
+import numpy as np
+import nrrd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models.video import r3d_18, R3D_18_Weights
+from sklearn.metrics import roc_auc_score
+import itertools
+import wandb
+
+# ================= CONFIGURATION =================
+CSV_PATH = "MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = "master_10fold_splits.csv"  
+IMAGE_DIR = "MCs_64x64x64"  
+
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+EPOCHS = 100               
+MIN_EPOCHS = 80            
+PATIENCE = 10               
+# =================================================
+
+def preload_all_volumes(df, root_dir):
+    print("--- PRELOADING ALL 3D VOLUMES INTO RAM ---")
+    volume_cache = {}
+    unique_images = df['Image Path'].unique()
+    
+    for i, img_name in enumerate(unique_images):
+        img_path = os.path.join(root_dir, img_name)
+        volume, _ = nrrd.read(img_path)
+        # Convert to tensor and add channel dimension (1, D, H, W)
+        vol_tensor = torch.tensor(volume, dtype=torch.float32).unsqueeze(0)
+        volume_cache[img_name] = vol_tensor
+        
+        if (i + 1) % 500 == 0:
+            print(f"  Loaded {i + 1} / {len(unique_images)} volumes...")
+            
+    print(f"--- SUCCESSFULLY PRELOADED {len(volume_cache)} VOLUMES ---")
+    return volume_cache
+
+# --- 1. 3D IMAGE DATASET (PRELOADED) ---
+class MCs3DDataset(Dataset):
+    def __init__(self, dataframe, volume_cache):
+        self.dataframe = dataframe.reset_index(drop=True)
+        # Store a reference to the global preloaded dictionary
+        self.volume_cache = volume_cache
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx]['Image Path']
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+        
+        # Instantly pull the 3D tensor from RAM
+        vol_tensor = self.volume_cache[img_name]
+        
+        return vol_tensor, label
+
+# --- 2. 3D RESNET18 WRAPPER (TRAINED FROM SCRATCH) ---
+class ResNet3DWrapper(nn.Module):
+    def __init__(self, dropout_rate):
+        super(ResNet3DWrapper, self).__init__()
+        
+        # 1. Load ResNet WITHOUT pre-trained weights (Random Initialization)
+        self.base_model = r3d_18(weights=None)
+        
+        # 2. Extract the original 3-channel layer to copy its properties
+        original_conv1 = self.base_model.stem[0]
+        
+        # 3. Create the new 1-channel layer 
+        # (PyTorch randomly initializes these new weights automatically)
+        self.base_model.stem[0] = nn.Conv3d(
+            in_channels=1, 
+            out_channels=original_conv1.out_channels, 
+            kernel_size=original_conv1.kernel_size, 
+            stride=original_conv1.stride, 
+            padding=original_conv1.padding, 
+            bias=False
+        )
+        
+        # 4. Modify classification head
+        num_ftrs = self.base_model.fc.in_features
+        self.base_model.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_ftrs, 1)
+        )
+        
+    def forward(self, x):
+        x = self.base_model(x)
+        return x.to(torch.float32)
+
+# --- 3. MAIN GRID SEARCH PIPELINE ---
+def main():
+    print("--- LOADING DATA AND FIXED SPLITS ---")
+    df = pd.read_excel(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    
+    # -> CALL THE PRELOAD FUNCTION HERE <-
+    global_volume_cache = preload_all_volumes(df, IMAGE_DIR)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- USING DEVICE: {device} ---")
+
+    param_grid = {
+        'lr': [1e-4, 1e-5, 1e-6],                 
+        'weight_decay': [1e-3],             
+        'batch_size': [16],  
+        'dropout_rate': [0.4,0.6]
+    }
+    
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    print(f"--- STARTING 3D RESNET GRID SEARCH ({len(combinations)} Configurations) ---")
+
+    best_overall_val_auc = 0.0
+    best_overall_test_auc = 0.0
+    best_params = None
+
+    for config_idx, config in enumerate(combinations):
+        if config_idx < 4:
+            print(f"Skipping Config [{config_idx+1}/{len(combinations)}]: {config}")
+            continue
+        # ---------------------------------------------------------
+        print(f"\n[{config_idx+1}/{len(combinations)}] Testing Params: {config}")
+        
+        run_name = f"ResNet3D_AMP_lr{config['lr']}_bs{config['batch_size']}_drop{config['dropout_rate']}"
+        wandb.init(
+            project="embed-thesis-phase2-ResNet3D",
+            name=run_name,
+            config=config,
+            reinit=True
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        
+        fold_val_losses = []
+        fold_val_aucs = []
+        fold_test_aucs = []
+        
+        for current_fold in range(1, 11):
+            fold_df = df[df['Fold'] == current_fold]
+            
+            train_df = fold_df[fold_df['Split'] == 'Train'].copy()
+            val_df = fold_df[fold_df['Split'] == 'Val'].copy()
+            test_df = fold_df[fold_df['Split'] == 'Test'].copy()
+            
+            train_dataset = MCs3DDataset(train_df, global_volume_cache)
+            val_dataset = MCs3DDataset(val_df, global_volume_cache)
+            test_dataset = MCs3DDataset(test_df, global_volume_cache)
+
+            train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=2)
+            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=2)
+            test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=2)
+
+            model = ResNet3DWrapper(dropout_rate=config['dropout_rate']).to(device)
+            
+            num_neg = len(train_df[train_df[TARGET_COLUMN] == 0])
+            num_pos = len(train_df[train_df[TARGET_COLUMN] == 1])
+            pos_weight = torch.tensor([num_neg / num_pos]).to(device) if num_pos > 0 else torch.tensor([1.0]).to(device)
+
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            optimizer = optim.Adam(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
+            
+            # --- FIX: INITIALIZE MIXED PRECISION SCALER ---
+            scaler = torch.amp.GradScaler('cuda')
+            
+            best_fold_val_loss = float('inf')
+            best_model_weights = None
+            patience_counter = 0
+            
+            for epoch in range(EPOCHS):
+                # --- TRAINING ---
+                model.train()
+                running_train_loss = 0.0
+                for volumes, labels in train_loader:
+                    volumes, labels = volumes.to(device), labels.float().unsqueeze(1).to(device)
+                    optimizer.zero_grad()
+                    
+                    # --- FIX: AUTOCAST TO FP16 ---
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(volumes)
+                        loss = criterion(outputs, labels)
+                        
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    running_train_loss += loss.item()
+                
+                avg_train_loss = running_train_loss / len(train_loader)
+                
+                # --- VALIDATION ---
+                model.eval()
+                running_val_loss = 0.0
+                val_true, val_pred = [], []
+                with torch.no_grad():
+                    for volumes, labels in val_loader:
+                        volumes, labels = volumes.to(device), labels.float().unsqueeze(1).to(device)
+                        
+                        # Also use autocast for faster validation inference
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            outputs = model(volumes)
+                            loss = criterion(outputs, labels)
+                            
+                        running_val_loss += loss.item()
+                        val_true.extend(labels.cpu().numpy())
+                        val_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                
+                avg_val_loss = running_val_loss / len(val_loader)
+                
+                try:
+                    val_auc = roc_auc_score(val_true, val_pred)
+                except ValueError:
+                    val_auc = 0.5
+                
+                wandb.log({
+                    f"fold_{current_fold}_train_loss": avg_train_loss,
+                    f"fold_{current_fold}_val_loss": avg_val_loss,
+                    f"fold_{current_fold}_val_auc": val_auc,
+                    "epoch": epoch
+                })
+
+                if avg_val_loss < best_fold_val_loss:
+                    best_fold_val_loss = avg_val_loss
+                    best_model_weights = copy.deepcopy(model.state_dict()) 
+                    patience_counter = 0
+                elif epoch >= MIN_EPOCHS:
+                    patience_counter += 1
+                
+                if epoch >= MIN_EPOCHS and patience_counter >= PATIENCE:
+                    print(f"  [!] Fold {current_fold} Early stopping at Epoch {epoch+1} (Best Val Loss: {best_fold_val_loss:.4f})")
+                    break
+            
+            # --- EVALUATE ON TEST SET ---
+            model.load_state_dict(best_model_weights)
+            model.eval()
+            
+            val_true_best, val_pred_best = [], []
+            with torch.no_grad():
+                for volumes, labels in val_loader:
+                    volumes = volumes.to(device)
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(volumes)
+                    val_true_best.extend(labels.numpy())
+                    val_pred_best.extend(torch.sigmoid(outputs).cpu().numpy())
+            fold_val_aucs.append(roc_auc_score(val_true_best, val_pred_best))
+            
+            test_true, test_pred = [], []
+            with torch.no_grad():
+                for volumes, labels in test_loader:
+                    volumes = volumes.to(device)
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(volumes)
+                    test_true.extend(labels.numpy())
+                    test_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                    
+            try:
+                test_auc = roc_auc_score(test_true, test_pred)
+            except ValueError:
+                test_auc = 0.5
+                
+            fold_val_losses.append(best_fold_val_loss)
+            fold_test_aucs.append(test_auc)
+            
+            wandb.log({
+                f"final_fold_{current_fold}_val_loss": best_fold_val_loss,
+                f"final_fold_{current_fold}_test_auc": test_auc
+            })
+            print(f"    -> Fold {current_fold} True Test AUC: {test_auc:.4f}")
+            
+        mean_val_loss = np.mean(fold_val_losses)
+        mean_val_auc = np.mean(fold_val_aucs)
+        std_val_auc = np.std(fold_val_aucs)
+        mean_test_auc = np.mean(fold_test_aucs)
+        std_test_auc = np.std(fold_test_aucs)
+        
+        print(f"\n -> Config Val Loss: {mean_val_loss:.4f}")
+        print(f" -> Config Val AUC:  {mean_val_auc:.4f} ± {std_val_auc:.4f}")
+        print(f" -> Config Test AUC: {mean_test_auc:.4f} ± {std_test_auc:.4f}")
+        
+        wandb.log({
+            "mean_val_loss": mean_val_loss,
+            "mean_val_auc": mean_val_auc, "std_val_auc": std_val_auc,
+            "mean_test_auc": mean_test_auc, "std_test_auc": std_test_auc
+        })
+        wandb.finish() 
+        
+        if mean_val_auc > best_overall_val_auc:
+            best_overall_val_auc = mean_val_auc
+            best_overall_test_auc = mean_test_auc
+            best_params = config
+
+    print("\n" + "="*50)
+    print("3D RESNET18 HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("="*50)
+    print(f"BEST MEAN CV AUC (Validation): {best_overall_val_auc:.4f}")
+    print(f"TRUE HOLDOUT TEST AUC (Unseen): {best_overall_test_auc:.4f}")
+    print(f"OPTIMAL PARAMETERS: {best_params}")
+    print("="*50 + "\n")
+
+if __name__ == '__main__':
+    main()
