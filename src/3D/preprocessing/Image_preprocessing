@@ -75,10 +75,10 @@ def normalize_and_resize_mcs_with_aspect_ratio(all_MCs_images, desired_size, out
 if __name__ == '__main__':
     # ================= CONFIGURATION =================
     # 1. Point this to the folder containing your raw, unzipped .nrrd files
-    RAW_IMAGES_DIR = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\Zero_background_Images_Dilation_10" 
+    RAW_IMAGES_DIR = r"" 
     
     # 2. Where you want the new perfectly sized images to be saved
-    OUTPUT_DIR = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\MCs_64x64x64"
+    OUTPUT_DIR = r""
     # =================================================
 
     all_MCs_images = glob.glob(os.path.join(RAW_IMAGES_DIR, '*.nrrd'))
