@@ -1,0 +1,333 @@
+import os
+import copy
+import pandas as pd
+import numpy as np
+import nrrd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models.video import r3d_18
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, roc_curve, auc
+import matplotlib.pyplot as plt
+import wandb
+
+# ================= CONFIGURATION =================
+CSV_PATH = "MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = "master_10fold_splits.csv"  
+IMAGE_DIR = "MCs_64x64x64"  
+
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+# Optimized 3D ResNet18 Hyperparameters (Image Winner)
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-3
+DROPOUT_RATE = 0.6
+EPOCHS = 100
+MIN_EPOCHS = 80
+PATIENCE = 10
+
+# Optimized XGBoost Hyperparameters (Radiomics Winner)
+XGB_LR = 0.05
+XGB_DEPTH = 3
+XGB_ESTIMATORS = 200
+XGB_COLSAMPLE = 0.8
+XGB_SUBSAMPLE = 1.0
+# =================================================
+
+def preload_all_volumes(df, root_dir):
+    print("--- PRELOADING ALL 3D VOLUMES INTO RAM ---")
+    volume_cache = {}
+    unique_images = df['Image Path'].unique()
+    
+    for i, img_name in enumerate(unique_images):
+        img_path = os.path.join(root_dir, img_name)
+        volume, _ = nrrd.read(img_path)
+        vol_tensor = torch.tensor(volume, dtype=torch.float32).unsqueeze(0)
+        volume_cache[img_name] = vol_tensor
+        
+        if (i + 1) % 500 == 0:
+            print(f"  Loaded {i + 1} / {len(unique_images)} volumes...")
+            
+    print(f"--- SUCCESSFULLY PRELOADED {len(volume_cache)} VOLUMES ---")
+    return volume_cache
+
+# --- 1. 3D IMAGE DATASET (PRELOADED) ---
+class MCs3DDataset(Dataset):
+    def __init__(self, dataframe, volume_cache):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.volume_cache = volume_cache
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx]['Image Path']
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+        vol_tensor = self.volume_cache[img_name]
+        return vol_tensor, label
+
+# --- 2. 3D RESNET18 WRAPPER (TRAINED FROM SCRATCH) ---
+class ResNet3DWrapper(nn.Module):
+    def __init__(self, dropout_rate):
+        super(ResNet3DWrapper, self).__init__()
+        self.base_model = r3d_18(weights=None)
+        
+        original_conv1 = self.base_model.stem[0]
+        self.base_model.stem[0] = nn.Conv3d(
+            in_channels=1, 
+            out_channels=original_conv1.out_channels, 
+            kernel_size=original_conv1.kernel_size, 
+            stride=original_conv1.stride, 
+            padding=original_conv1.padding, 
+            bias=False
+        )
+        
+        num_ftrs = self.base_model.fc.in_features
+        self.base_model.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_ftrs, 1)
+        )
+        
+    def forward(self, x):
+        x = self.base_model(x)
+        return x.to(torch.float32)
+
+def plot_thesis_roc_curve(y_true, xgb_probs, cnn_probs, fusion_probs):
+    plt.figure(figsize=(10, 8), dpi=300)
+    
+    fpr_xgb, tpr_xgb, _ = roc_curve(y_true, xgb_probs)
+    auc_xgb = auc(fpr_xgb, tpr_xgb)
+    
+    fpr_cnn, tpr_cnn, _ = roc_curve(y_true, cnn_probs)
+    auc_cnn = auc(fpr_cnn, tpr_cnn)
+    
+    fpr_fusion, tpr_fusion, _ = roc_curve(y_true, fusion_probs)
+    auc_fusion = auc(fpr_fusion, tpr_fusion)
+    
+    plt.plot(fpr_xgb, tpr_xgb, label=f'Radiomic XGBoost (AUC = {auc_xgb:.4f})', color='#2ca02c', lw=2)
+    plt.plot(fpr_cnn, tpr_cnn, label=f'ResNet3D Image (AUC = {auc_cnn:.4f})', color='#1f77b4', lw=2)
+    plt.plot(fpr_fusion, tpr_fusion, label=f'Late Fusion Meta-Learner (AUC = {auc_fusion:.4f})', color='#d62728', lw=3)
+    plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Random Chance')
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=14)
+    plt.ylabel('True Positive Rate', fontsize=14)
+    plt.title('Phase 2: 3D Multimodal Late Fusion vs Modality Baselines', fontsize=16, fontweight='bold')
+    plt.legend(loc="lower right", fontsize=12)
+    plt.grid(alpha=0.3)
+    
+    plt.savefig('late_fusion_roc_curve_3D.png', bbox_inches='tight')
+    print("\n -> Saved high-resolution ROC curve to 'late_fusion_roc_curve_3D.png'")
+
+def main():
+    wandb.init(
+        project="embed-thesis-phase2-late-fusion",
+        name="Phase2_3D_LateFusion",
+        config={
+            "architecture": "ResNet3D + XGBoost Late Fusion",
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE
+        }
+    )
+
+    print("--- LOADING DATA AND FIXED SPLITS ---")
+    df = pd.read_excel(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    
+    global_volume_cache = preload_all_volumes(df, IMAGE_DIR)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- USING DEVICE: {device} ---")
+
+    # Dynamically extract all radiomic feature columns
+    metadata_cols = [PATIENT_ID_COLUMN, TARGET_COLUMN, 'Image Path', 'Mask Path', 'Fold', 'Split']
+    FEATURE_COLUMNS = [c for c in df.columns if c not in metadata_cols]
+
+    oof_true, oof_xgb, oof_cnn, oof_fusion = [], [], [], []
+    xgb_aucs, cnn_aucs, fusion_aucs = [], [], []
+
+    for current_fold in range(1, 11):
+        print("\n" + "="*50)
+        print(f"========== STARTING FOLD {current_fold}/10 ==========")
+        print("="*50)
+        
+        fold_df = df[df['Fold'] == current_fold]
+        train_df = fold_df[fold_df['Split'] == 'Train'].copy()
+        val_df = fold_df[fold_df['Split'] == 'Val'].copy()
+        test_df = fold_df[fold_df['Split'] == 'Test'].copy()
+        
+        oof_true.extend(test_df[TARGET_COLUMN].values)
+
+        # --- 1. TABULAR XGBOOST (Radiomics) ---
+        print("\n-> Training Tabular XGBoost...")
+        X_train = train_df[FEATURE_COLUMNS]
+        y_train = train_df[TARGET_COLUMN]
+        X_test = test_df[FEATURE_COLUMNS]
+        
+        imputer = SimpleImputer(strategy='mean')
+        scaler = StandardScaler()
+        
+        X_train_processed = scaler.fit_transform(imputer.fit_transform(X_train))
+        X_test_processed = scaler.transform(imputer.transform(X_test))
+        
+        num_neg = len(train_df[train_df[TARGET_COLUMN] == 0])
+        num_pos = len(train_df[train_df[TARGET_COLUMN] == 1])
+        scale_pos_weight = num_neg / num_pos if num_pos > 0 else 1.0
+        
+        xgb_model = XGBClassifier(
+            learning_rate=XGB_LR,
+            max_depth=XGB_DEPTH,
+            n_estimators=XGB_ESTIMATORS,
+            colsample_bytree=XGB_COLSAMPLE,
+            subsample=XGB_SUBSAMPLE,
+            scale_pos_weight=scale_pos_weight,
+            eval_metric='auc',
+            random_state=42
+        )
+        xgb_model.fit(X_train_processed, y_train)
+        
+        xgb_test_probs = xgb_model.predict_proba(X_test_processed)[:, 1]
+        xgb_auc = roc_auc_score(test_df[TARGET_COLUMN], xgb_test_probs)
+        xgb_aucs.append(xgb_auc)
+        oof_xgb.extend(xgb_test_probs)
+        print(f"   Radiomic XGBoost Test AUC: {xgb_auc:.4f}")
+
+        # --- 2. IMAGE CNN (ResNet3D) ---
+        print("\n-> Training Image ResNet3D...")
+        train_dataset = MCs3DDataset(train_df, global_volume_cache)
+        val_dataset = MCs3DDataset(val_df, global_volume_cache)
+        test_dataset = MCs3DDataset(test_df, global_volume_cache)
+
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+        model = ResNet3DWrapper(dropout_rate=DROPOUT_RATE).to(device)
+        pos_weight = torch.tensor([scale_pos_weight]).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scaler_amp = torch.amp.GradScaler('cuda')
+
+        best_fold_val_loss = float('inf')
+        best_model_weights = None
+        patience_counter = 0
+
+        for epoch in range(EPOCHS):
+            model.train()
+            running_train_loss = 0.0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                optimizer.zero_grad()
+                
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    loss = criterion(model(inputs), labels)
+                    
+                scaler_amp.scale(loss).backward()
+                scaler_amp.step(optimizer)
+                scaler_amp.update()
+                running_train_loss += loss.item()
+                
+            model.eval() 
+            running_val_loss = 0.0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                    running_val_loss += loss.item()
+                    
+            avg_val_loss = running_val_loss / len(val_loader)
+                
+            if avg_val_loss < best_fold_val_loss:
+                best_fold_val_loss = avg_val_loss
+                best_model_weights = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            elif epoch + 1 >= MIN_EPOCHS:
+                patience_counter += 1
+
+            if epoch + 1 >= MIN_EPOCHS and patience_counter >= PATIENCE:
+                print(f"   [!] CNN Early stopping at Epoch {epoch+1}")
+                break 
+
+        # Evaluate best CNN on Test set
+        model.load_state_dict(best_model_weights)
+        model.eval()
+        cnn_test_probs = []
+        with torch.no_grad():
+            for inputs, _ in test_loader:
+                inputs = inputs.to(device)
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(inputs)
+                cnn_test_probs.extend(torch.sigmoid(outputs).cpu().numpy().flatten())
+
+        cnn_test_auc = roc_auc_score(test_df[TARGET_COLUMN], cnn_test_probs)
+        cnn_aucs.append(cnn_test_auc)
+        oof_cnn.extend(cnn_test_probs)
+        print(f"   Image ResNet3D Test AUC: {cnn_test_auc:.4f}")
+
+        # --- 3. STACKING FUSION (META-LEARNER) ---
+        print("\n-> Training Meta-Learner (Fusion)...")
+        xgb_train_probs = xgb_model.predict_proba(X_train_processed)[:, 1]
+        
+        cnn_train_probs = []
+        train_loader_unshuffled = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+        with torch.no_grad():
+            for inputs, _ in train_loader_unshuffled:
+                inputs = inputs.to(device)
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(inputs)
+                cnn_train_probs.extend(torch.sigmoid(outputs).cpu().numpy().flatten())
+
+        X_meta_train = np.column_stack((xgb_train_probs, cnn_train_probs))
+        X_meta_test = np.column_stack((xgb_test_probs, cnn_test_probs))
+        
+        y_meta_train = train_df[TARGET_COLUMN]
+        y_meta_test = test_df[TARGET_COLUMN]
+
+        meta_model = LogisticRegression(class_weight='balanced')
+        meta_model.fit(X_meta_train, y_meta_train)
+        
+        fusion_probs = meta_model.predict_proba(X_meta_test)[:, 1]
+        fusion_auc = roc_auc_score(y_meta_test, fusion_probs)
+        fusion_aucs.append(fusion_auc)
+        oof_fusion.extend(fusion_probs)
+        
+        weights = meta_model.coef_[0]
+        print(f"   Meta-Learner Weights -> XGBoost: {weights[0]:.4f} | CNN: {weights[1]:.4f}")
+        print(f"   Fold {current_fold} FUSION TEST AUC: {fusion_auc:.4f}")
+
+        wandb.log({
+            f"fold_{current_fold}_xgb_test_auc": xgb_auc,
+            f"fold_{current_fold}_cnn_test_auc": cnn_test_auc,
+            f"fold_{current_fold}_fusion_test_auc": fusion_auc
+        })
+
+    # --- FINAL REPORT & PLOTTING ---
+    print("\n" + "="*50)
+    print("10-FOLD CV 3D LATE FUSION COMPLETE")
+    print("="*50)
+    print(f"Mean Radiomic XGBoost AUC: {np.mean(xgb_aucs):.4f} ± {np.std(xgb_aucs):.4f}")
+    print(f"Mean ResNet3D Image AUC:   {np.mean(cnn_aucs):.4f} ± {np.std(cnn_aucs):.4f}")
+    print(f"Mean LATE FUSION AUC:      {np.mean(fusion_aucs):.4f} ± {np.std(fusion_aucs):.4f}")
+    print("="*50)
+    
+    plot_thesis_roc_curve(oof_true, oof_xgb, oof_cnn, oof_fusion)
+    
+    wandb.log({
+        "mean_xgb_test_auc": np.mean(xgb_aucs),
+        "mean_cnn_test_auc": np.mean(cnn_aucs),
+        "mean_fusion_test_auc": np.mean(fusion_aucs)
+    })
+    wandb.finish()
+
+if __name__ == '__main__':
+    main()
