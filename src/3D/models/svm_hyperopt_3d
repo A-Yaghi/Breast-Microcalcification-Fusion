@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import ParameterGrid
+
+# ================= CONFIGURATION =================
+EXCEL_PATH = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\MCs_radiomics_features_Zero_background_Dilation_10_after_correlation.xlsx"
+SPLIT_CSV_PATH = r"C:\Users\q_51_\Desktop\UniNotes\Thesis\Latest 3D Dataset\master_10fold_splits.csv"
+
+TARGET_COLUMN = 'Label'
+PATIENT_ID_COLUMN = 'Patient ID'
+
+METADATA_COLUMNS = ['Patient ID', 'Label', 'Image Path', 'Fold', 'Split']
+# =================================================
+
+def main():
+    print("--- LOADING RADIOMICS AND FIXED SPLITS ---")
+    df = pd.read_excel(EXCEL_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    splits_df = pd.read_csv(SPLIT_CSV_PATH)
+    
+    # Merge the dataset with the splits. 
+    # Because there are 10 folds, this duplicates the dataset 10 times under the hood, 
+    # assigning each row its specific Train/Val/Test designation for that specific fold.
+    df = df.merge(splits_df, on=PATIENT_ID_COLUMN, how='inner')
+    FEATURE_COLUMNS = [col for col in df.columns if col not in METADATA_COLUMNS]
+
+    # 1. Define Pipeline and Hyperparameters
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+        ('svm', SVC(probability=True, class_weight='balanced', random_state=42))
+    ])
+
+    param_grid = {
+        'svm__C': [0.01, 0.1, 1, 10, 100],            
+        'svm__kernel': ['linear', 'rbf', 'poly'],     
+        'svm__gamma': ['scale', 'auto', 0.01, 0.1],   
+        'svm__degree': [2, 3]                         
+    }
+    
+    grid = ParameterGrid(param_grid)
+    print(f"\n--- STARTING CUSTOM 10-FOLD GRID SEARCH ({len(grid)} Configurations) ---")
+
+    best_mean_val_auc = 0.0
+    best_params = None
+    
+    # 2. Phase 1: Hyperparameter Tuning (using Train and Val)
+    for idx, params in enumerate(grid):
+        pipeline.set_params(**params)
+        fold_val_aucs = []
+        
+        for current_fold in range(1, 11):
+            # Extract data specifically for this fold
+            fold_df = df[df['Fold'] == current_fold]
+            
+            train_df = fold_df[fold_df['Split'] == 'Train']
+            val_df = fold_df[fold_df['Split'] == 'Val']
+            
+            X_train, y_train = train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN]
+            X_val, y_val = val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN]
+            
+            # Train and Validate
+            pipeline.fit(X_train, y_train)
+            val_probs = pipeline.predict_proba(X_val)[:, 1]
+            fold_val_aucs.append(roc_auc_score(y_val, val_probs))
+            
+        mean_val_auc = np.mean(fold_val_aucs)
+        
+        # Track the best performing configuration
+        if mean_val_auc > best_mean_val_auc:
+            best_mean_val_auc = mean_val_auc
+            best_params = params
+
+    # 3. Phase 2: Final Unbiased Evaluation on Test Sets
+    print("\n--- TUNING COMPLETE. EVALUATING BEST MODEL ON UNSEEN TEST SETS ---")
+    pipeline.set_params(**best_params)
+    test_aucs = []
+    val_aucs_for_best = [] # Re-calculating to get the exact std dev for reporting
+    
+    for current_fold in range(1, 11):
+        fold_df = df[df['Fold'] == current_fold]
+        
+        train_df = fold_df[fold_df['Split'] == 'Train']
+        val_df = fold_df[fold_df['Split'] == 'Val']
+        test_df = fold_df[fold_df['Split'] == 'Test']
+        
+        X_train, y_train = train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN]
+        X_val, y_val = val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN]
+        X_test, y_test = test_df[FEATURE_COLUMNS], test_df[TARGET_COLUMN]
+        
+        pipeline.fit(X_train, y_train)
+        
+        val_probs = pipeline.predict_proba(X_val)[:, 1]
+        val_aucs_for_best.append(roc_auc_score(y_val, val_probs))
+        
+        test_probs = pipeline.predict_proba(X_test)[:, 1]
+        test_aucs.append(roc_auc_score(y_test, test_probs))
+
+    # 4. Final Reporting
+    print("\n" + "="*60)
+    print("STRICT 10-FOLD CROSS-VALIDATION COMPLETE")
+    print("="*60)
+    print(f"BEST MEAN VAL AUC:  {np.mean(val_aucs_for_best):.4f} ± {np.std(val_aucs_for_best):.4f}")
+    print(f"TRUE MEAN TEST AUC: {np.mean(test_aucs):.4f} ± {np.std(test_aucs):.4f}")
+    print("\nOPTIMAL PARAMETERS:")
+    for param_name, param_value in best_params.items():
+        print(f"  * {param_name.replace('svm__', '')}: {param_value}")
+    print("="*60 + "\n")
+
+if __name__ == '__main__':
+    main()
