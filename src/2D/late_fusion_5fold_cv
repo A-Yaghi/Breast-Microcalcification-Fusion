@@ -1,0 +1,278 @@
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from sklearn.model_selection import GroupKFold
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+from PIL import Image
+import wandb 
+
+# ================= CONFIGURATION =================
+CSV_PATH = "Tabular/training_manifest.csv"
+IMAGE_DIR = "Images"  
+IMAGE_SIZE = 512     
+N_SPLITS = 5
+
+TARGET_COLUMN = 'target_label'
+PATIENT_ID_COLUMN = 'empi_anon'
+
+# Optimized Hyperparameters
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 0.001
+DROPOUT_RATE = 0.5
+SVM_C = 0.1
+SVM_KERNEL = 'linear'
+
+EPOCHS = 100
+MIN_EPOCHS = 50
+PATIENCE = 10
+# =================================================
+
+FEATURE_COLUMNS = [
+    'age_at_study', 'size', 'distance', 'tissueden',
+    'location_1', 'location_10', 'location_11', 'location_12', 'location_2', 
+    'location_3', 'location_3,S', 'location_4', 'location_6', 'location_6,I', 
+    'location_6,Y,Z', 'location_8', 'location_9', 'location_A', 'location_C', 
+    'location_C,UP', 'location_D', 'location_I', 'location_IN', 'location_L', 
+    'location_L,S', 'location_MD', 'location_OU', 'location_S', 'location_U', 
+    'location_UP', 'location_Unknown', 'location_W', 'location_W,X,C', 
+    'location_X', 'location_Y', 'location_Z',
+    'depth_A', 'depth_M', 'depth_P', 'depth_Unknown',
+    'ETHNIC_GROUP_DESC_Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Non-Hispanic or Latino', 
+    'ETHNIC_GROUP_DESC_Not Recorded', 
+    'ETHNIC_GROUP_DESC_Unknown~Non-Hispanic', 
+    'ETHNIC_GROUP_DESC_Unreported, Unknown, Unavailable',
+    'ETHNICITY_DESC_African American  or Black', 
+    'ETHNICITY_DESC_American Indian or Alaskan Native', 
+    'ETHNICITY_DESC_Asian', 
+    'ETHNICITY_DESC_Caucasian or White', 
+    'ETHNICITY_DESC_Multiple', 
+    'ETHNICITY_DESC_Unknown, Unavailable or Unreported',
+    'calcfind_A', 'calcfind_B', 'calcfind_F', 'calcfind_G', 'calcfind_H', 
+    'calcfind_I', 'calcfind_K', 'calcfind_M', 'calcfind_P', 'calcfind_Q', 
+    'calcfind_R',
+    'calcdistri_C', 'calcdistri_D', 'calcdistri_G', 'calcdistri_L', 
+    'calcdistri_R', 'calcdistri_S', 'calcdistri_Unknown'
+]
+
+class MammographyDataset(Dataset):
+    def __init__(self, dataframe, root_dir, transform=None):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_rel_path = self.dataframe.iloc[idx]['cropped_image_file']
+        img_rel_path = img_rel_path.replace('Actionable', 'Malignant').replace('Nonactionable', 'Benign')
+        img_path = os.path.join(self.root_dir, img_rel_path)
+        
+        image = Image.open(img_path).convert('L')
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+def main():
+    wandb.init(
+        project="embed-mammography-thesis",
+        name="late-fusion-5fold-cv-optimized",
+        config={
+            "architecture": "Optimized ResNet18 + Optimized SVM",
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE
+        }
+    )
+
+    print("--- LOADING DATA ---")
+    df = pd.read_csv(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    gkf = GroupKFold(n_splits=N_SPLITS)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # CLEAN TRANSFORMS: No CLAHE, just raw images and ImageNet normalization
+    train_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.RandomHorizontalFlip(p=0.5), 
+        transforms.RandomVerticalFlip(p=0.5),   
+        transforms.RandomRotation(degrees=15),  
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    svm_aucs, cnn_aucs, fusion_aucs = [], [], []
+
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(df, groups=df[PATIENT_ID_COLUMN])):
+        print("\n" + "="*50)
+        print(f"========== STARTING FOLD {fold + 1}/{N_SPLITS} ==========")
+        print("="*50)
+        
+        train_df = df.iloc[train_idx].copy()
+        val_df = df.iloc[val_idx].copy()
+        
+        # --- 1. TABULAR SVM ---
+        print("\n-> Training Tabular SVM...")
+        X_train = train_df[FEATURE_COLUMNS]
+        y_train = train_df[TARGET_COLUMN]
+        X_val = val_df[FEATURE_COLUMNS]
+        
+        imputer = SimpleImputer(strategy='mean')
+        scaler = StandardScaler()
+        
+        X_train_processed = scaler.fit_transform(imputer.fit_transform(X_train))
+        X_val_processed = scaler.transform(imputer.transform(X_val))
+        
+        svm_model = SVC(kernel=SVM_KERNEL, C=SVM_C, gamma='scale', degree=2, probability=True, class_weight='balanced', random_state=42)
+        svm_model.fit(X_train_processed, y_train)
+        
+        svm_val_probs = svm_model.predict_proba(X_val_processed)[:, 1]
+        svm_auc = roc_auc_score(val_df[TARGET_COLUMN], svm_val_probs)
+        svm_aucs.append(svm_auc)
+        print(f"   Tabular SVM AUC: {svm_auc:.4f}")
+
+        # --- 2. IMAGE CNN (ResNet18) ---
+        print("\n-> Training Image ResNet18...")
+        train_dataset = MammographyDataset(train_df, IMAGE_DIR, train_transform)
+        val_dataset = MammographyDataset(val_df, IMAGE_DIR, val_transform)
+
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Dropout(DROPOUT_RATE), 
+            nn.Linear(num_ftrs, 1)
+        )
+        model = model.to(device)
+
+        num_neg = len(train_df[train_df[TARGET_COLUMN] == 0])
+        num_pos = len(train_df[train_df[TARGET_COLUMN] == 1])
+        pos_weight = torch.tensor([num_neg / num_pos]).to(device)
+
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+        best_fold_auc = 0.0
+        patience_counter = 0
+
+        for epoch in range(EPOCHS):
+            model.train()
+            running_train_loss = 0.0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(inputs), labels)
+                loss.backward()
+                optimizer.step()
+                running_train_loss += loss.item()
+                
+            model.eval() 
+            val_true, val_pred = [], []
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                    outputs = model(inputs)
+                    val_true.extend(labels.cpu().numpy())
+                    val_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                    
+            try:
+                val_auc = roc_auc_score(val_true, val_pred)
+            except ValueError:
+                val_auc = 0.5 
+                
+            if val_auc > best_fold_auc:
+                best_fold_auc = val_auc
+                patience_counter = 0
+                torch.save(model.state_dict(), f'best_fusion_cnn_fold{fold+1}.pth')
+            elif epoch + 1 >= MIN_EPOCHS:
+                patience_counter += 1
+
+            if epoch + 1 >= MIN_EPOCHS and patience_counter >= PATIENCE:
+                print(f"   [!] CNN Early stopping at Epoch {epoch+1}")
+                break 
+
+        cnn_aucs.append(best_fold_auc)
+        print(f"   Image CNN AUC: {best_fold_auc:.4f}")
+
+        # --- 3. STACKING FUSION (META-LEARNER) ---
+        print("\n-> Training Meta-Learner (Fusion)...")
+        svm_train_probs = svm_model.predict_proba(X_train_processed)[:, 1]
+        
+        model.load_state_dict(torch.load(f'best_fusion_cnn_fold{fold+1}.pth'))
+        model.eval()
+        
+        cnn_train_probs = []
+        with torch.no_grad():
+            train_loader_unshuffled = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+            for inputs, _ in train_loader_unshuffled:
+                outputs = model(inputs.to(device))
+                cnn_train_probs.extend(torch.sigmoid(outputs).cpu().numpy().flatten())
+                
+        cnn_val_probs = []
+        with torch.no_grad():
+            for inputs, _ in val_loader:
+                outputs = model(inputs.to(device))
+                cnn_val_probs.extend(torch.sigmoid(outputs).cpu().numpy().flatten())
+
+        X_meta_train = np.column_stack((svm_train_probs, cnn_train_probs))
+        X_meta_val = np.column_stack((svm_val_probs, cnn_val_probs))
+        
+        y_meta_train = train_df[TARGET_COLUMN]
+        y_meta_val = val_df[TARGET_COLUMN]
+
+        meta_model = LogisticRegression(class_weight='balanced')
+        meta_model.fit(X_meta_train, y_meta_train)
+        
+        fusion_probs = meta_model.predict_proba(X_meta_val)[:, 1]
+        fusion_auc = roc_auc_score(y_meta_val, fusion_probs)
+        fusion_aucs.append(fusion_auc)
+        
+        weights = meta_model.coef_[0]
+        print(f"   Meta-Learner Weights -> SVM: {weights[0]:.4f} | CNN: {weights[1]:.4f}")
+        print(f"   Fold {fold+1} FUSION AUC: {fusion_auc:.4f}")
+
+        wandb.log({
+            f"fold_{fold+1}_svm_auc": svm_auc,
+            f"fold_{fold+1}_cnn_auc": best_fold_auc,
+            f"fold_{fold+1}_fusion_auc": fusion_auc
+        })
+
+    # --- FINAL REPORT ---
+    print("\n" + "="*50)
+    print("5-FOLD CV LATE FUSION COMPLETE")
+    print("="*50)
+    print(f"Mean SVM AUC:    {np.mean(svm_aucs):.4f} ± {np.std(svm_aucs):.4f}")
+    print(f"Mean CNN AUC:    {np.mean(cnn_aucs):.4f} ± {np.std(cnn_aucs):.4f}")
+    print(f"Mean FUSION AUC: {np.mean(fusion_aucs):.4f} ± {np.std(fusion_aucs):.4f}")
+    print("="*50 + "\n")
+    
+    wandb.log({
+        "mean_svm_auc": np.mean(svm_aucs),
+        "mean_cnn_auc": np.mean(cnn_aucs),
+        "mean_fusion_auc": np.mean(fusion_aucs)
+    })
+    wandb.finish()
+
+if __name__ == '__main__':
+    main()
