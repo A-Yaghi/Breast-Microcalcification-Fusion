@@ -1,0 +1,215 @@
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import roc_auc_score
+from PIL import Image
+import wandb 
+import itertools
+
+# ================= CONFIGURATION =================
+CSV_PATH = "Tabular/training_manifest_all.csv"  # <-- UPDATED
+IMAGE_DIR = "Images_All"                        # <-- UPDATED
+IMAGE_SIZE = 512     
+N_SPLITS = 5
+
+TARGET_COLUMN = 'target_label'
+PATIENT_ID_COLUMN = 'empi_anon'
+
+EPOCHS = 200              
+MIN_EPOCHS = 100           # Enforce 100 epochs minimum before early stopping
+PATIENCE = 10              # Epochs to wait for improvement after MIN_EPOCHS
+# =================================================
+
+# --- 1. DATASET CLASS ---
+class MammographyDataset(Dataset):
+    def __init__(self, dataframe, root_dir, transform=None):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.root_dir = root_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_rel_path = self.dataframe.iloc[idx]['cropped_image_file']
+        # <-- DELETED THE .replace() LINE HERE -->
+        img_path = os.path.join(self.root_dir, img_rel_path)
+        
+        image = Image.open(img_path).convert('L')
+        label = int(self.dataframe.iloc[idx][TARGET_COLUMN])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+def main():
+    print("--- LOADING DATA ---")
+    df = pd.read_csv(CSV_PATH).dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    gkf = GroupKFold(n_splits=N_SPLITS)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- 2. THE EXPANDED HYPERPARAMETER GRID ---
+    param_grid = {
+        'lr': [1e-3, 1e-4, 1e-5, 1e-6],           
+        'weight_decay': [1e-3, 1e-4],             
+        'batch_size': [16, 32],                   
+        'dropout_rate': [0.3, 0.5]                
+    }
+    
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    print(f"--- STARTING GRID SEARCH ({len(combinations)} Configurations | {len(combinations) * N_SPLITS} Total Fits) ---")
+
+    train_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(15),
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), 
+        transforms.Grayscale(num_output_channels=3), 
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    best_overall_auc = 0.0
+    best_params = None
+
+    # --- 3. OUTER LOOP: CONFIGURATIONS ---
+    for config_idx, config in enumerate(combinations):
+        print(f"\n[{config_idx+1}/{len(combinations)}] Testing Params: {config}")
+        
+        run_name = f"ResNet_lr{config['lr']}_L2{config['weight_decay']}_bs{config['batch_size']}_drop{config['dropout_rate']}"
+        wandb.init(
+            project="embed-thesis-all-ResNet",  # <-- UPDATED PROJECT NAME
+            name=run_name,
+            config=config,
+            reinit=True
+        )
+        
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+        
+        fold_aucs = []
+        
+        # --- 4. INNER LOOP: 5-FOLD CV ---
+        for fold, (train_idx, val_idx) in enumerate(gkf.split(df, groups=df[PATIENT_ID_COLUMN])):
+            print(f"  -> Starting Fold {fold+1}/{N_SPLITS}")
+            train_df, val_df = df.iloc[train_idx].copy(), df.iloc[val_idx].copy()
+            
+            train_dataset = MammographyDataset(train_df, IMAGE_DIR, train_transform)
+            val_dataset = MammographyDataset(val_df, IMAGE_DIR, val_transform)
+
+            train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
+            val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+
+            # Initialize Model
+            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            num_ftrs = model.fc.in_features
+            
+            model.fc = nn.Sequential(
+                nn.Dropout(config['dropout_rate']),
+                nn.Linear(num_ftrs, 1)
+            )
+            model = model.to(device)
+            
+            num_neg = len(train_df[train_df[TARGET_COLUMN] == 0])
+            num_pos = len(train_df[train_df[TARGET_COLUMN] == 1])
+            pos_weight = torch.tensor([num_neg / num_pos]).to(device)
+
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            optimizer = optim.Adam(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
+            
+            best_fold_auc = 0.0
+            patience_counter = 0
+            
+            # --- 5. TRAINING LOOP ---
+            for epoch in range(EPOCHS):
+                model.train()
+                running_train_loss = 0.0
+                
+                for inputs, labels in train_loader:
+                    inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                    optimizer.zero_grad()
+                    loss = criterion(model(inputs), labels)
+                    loss.backward()
+                    optimizer.step()
+                    running_train_loss += loss.item()
+                
+                avg_train_loss = running_train_loss / len(train_loader)
+                
+                model.eval()
+                running_val_loss = 0.0
+                val_true, val_pred = [], []
+                
+                with torch.no_grad():
+                    for inputs, labels in val_loader:
+                        inputs, labels = inputs.to(device), labels.float().unsqueeze(1).to(device)
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                        running_val_loss += loss.item()
+                        val_true.extend(labels.cpu().numpy())
+                        val_pred.extend(torch.sigmoid(outputs).cpu().numpy())
+                
+                avg_val_loss = running_val_loss / len(val_loader)
+                
+                try:
+                    val_auc = roc_auc_score(val_true, val_pred)
+                except ValueError:
+                    val_auc = 0.5
+                
+                wandb.log({
+                    f"fold_{fold+1}_train_loss": avg_train_loss,
+                    f"fold_{fold+1}_val_loss": avg_val_loss,
+                    f"fold_{fold+1}_val_auc": val_auc,
+                    "epoch": epoch + 1
+                })
+
+                # --- EARLY STOPPING LOGIC ---
+                if val_auc > best_fold_auc:
+                    best_fold_auc = val_auc
+                    patience_counter = 0 
+                elif epoch + 1 >= MIN_EPOCHS:
+                    patience_counter += 1 
+                
+                if epoch + 1 >= MIN_EPOCHS and patience_counter >= PATIENCE:
+                    print(f"     [!] Early stopping at Epoch {epoch+1} (Best AUC: {best_fold_auc:.4f})")
+                    break
+                    
+            fold_aucs.append(best_fold_auc)
+            wandb.log({f"final_fold_{fold+1}_auc": best_fold_auc})
+            
+        mean_cv_auc = np.mean(fold_aucs)
+        std_cv_auc = np.std(fold_aucs)
+        print(f" -> Mean AUC for config: {mean_cv_auc:.4f} ± {std_cv_auc:.4f}")
+        
+        wandb.log({"mean_cv_auc": mean_cv_auc, "std_cv_auc": std_cv_auc})
+        wandb.finish() 
+        
+        if mean_cv_auc > best_overall_auc:
+            best_overall_auc = mean_cv_auc
+            best_params = config
+
+    # --- 6. FINAL REPORT ---
+    print("\n" + "="*50)
+    print("RESNET18 HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("="*50)
+    print(f"BEST MEAN CV AUC: {best_overall_auc:.4f}")
+    print(f"OPTIMAL PARAMETERS: {best_params}")
+    print("="*50 + "\n")
+
+if __name__ == '__main__':
+    main()
